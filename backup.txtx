@@ -1,0 +1,224 @@
+const vscode = require("vscode");
+const fs = require("fs");
+const path = require("path");
+
+async function activate(context) {
+  console.log("FactoryBot extension activated");
+
+  let disposable = vscode.commands.registerCommand(
+    "factorybotlookup.lookupFactory",
+    async () => {
+      console.log("lookupFactory command invoked");
+      const workspaceFolders = vscode.workspace.workspaceFolders;
+      if (!workspaceFolders) {
+        vscode.window.showErrorMessage("No workspace folder found");
+        return;
+      }
+
+      const factoryFiles = await findFactoryFiles(
+        workspaceFolders[0].uri.fsPath
+      );
+      const factoryNames = await extractFactoryNames(factoryFiles);
+
+      const sortedFactoryNames = factoryNames
+        .map((item) => item.displayName)
+        .sort((a, b) => a.localeCompare(b));
+
+      const factory = await vscode.window.showQuickPick(sortedFactoryNames, {
+        placeHolder: "Type the FactoryBot factory name",
+      });
+
+      if (factory) {
+        const selectedFactory = factoryNames.find(
+          (item) => item.displayName === factory
+        );
+        if (selectedFactory) {
+          insertFactoryName(selectedFactory);
+        }
+      }
+    }
+  );
+
+  context.subscriptions.push(disposable);
+
+  context.subscriptions.push(
+    vscode.languages.registerCompletionItemProvider(
+      "ruby",
+      {
+        async provideCompletionItems(document, position) {
+          console.log("provideCompletionItems triggered");
+          const linePrefix = document
+            .lineAt(position)
+            .text.substr(0, position.character);
+
+          if (
+            !linePrefix.endsWith("create(:") &&
+            !linePrefix.endsWith("build(:")
+          ) {
+            console.log("No match for create(: or build(:");
+            return undefined;
+          }
+
+          const workspaceFolders = vscode.workspace.workspaceFolders;
+          if (!workspaceFolders) {
+            vscode.window.showErrorMessage("No workspace folder found");
+            return undefined;
+          }
+
+          const factoryFiles = await findFactoryFiles(
+            workspaceFolders[0].uri.fsPath
+          );
+          const factoryNames = await extractFactoryNames(factoryFiles);
+
+          const completionItems = factoryNames.map((factory) => {
+            const factoryName = factory.displayName.split(" - ")[1];
+            const completionItem = new vscode.CompletionItem(
+              factoryName,
+              vscode.CompletionItemKind.Keyword
+            );
+            completionItem.detail = factory.displayName;
+            completionItem.documentation = new vscode.MarkdownString(
+              `Insert ${factoryName}`
+            );
+            return completionItem;
+          });
+
+          console.log("Completion items:", completionItems);
+
+          return completionItems;
+        },
+      },
+      ":"
+    )
+  );
+
+  context.subscriptions.push(
+    vscode.languages.registerDefinitionProvider("ruby", {
+      provideDefinition(document, position, token) {
+        console.log("provideDefinition triggered");
+        const line = document.lineAt(position);
+        const text = line.text.substring(0, position.character);
+
+        console.log("Line text:", text);
+
+        const factoryMatch = text.match(/(create|build)\(\s*:(\w+)/);
+        if (!factoryMatch) {
+          console.log("No factory match found.");
+          return;
+        }
+
+        const factoryName = factoryMatch[2];
+        console.log("Factory match found:", factoryName);
+
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        if (!workspaceFolders) {
+          vscode.window.showErrorMessage("No workspace folder found");
+          return;
+        }
+
+        return findFactoryFiles(workspaceFolders[0].uri.fsPath).then(
+          (factoryFiles) =>
+            extractFactoryNames(factoryFiles).then((factoryNames) => {
+              const factory = factoryNames.find(
+                (item) => item.displayName.split(" - ")[1] === factoryName
+              );
+              if (factory) {
+                console.log("Factory definition found:", factory);
+                const uri = vscode.Uri.file(factory.filePath);
+                const position = new vscode.Position(factory.line - 1, 0);
+                return new vscode.Location(uri, position);
+              } else {
+                console.log("Factory definition not found.");
+              }
+              return;
+            })
+        );
+      },
+    })
+  );
+}
+
+function findFactoryFiles(workspacePath) {
+  console.log("Finding factory files in:", workspacePath);
+  const factoryDir = path.join(workspacePath, "spec", "factories");
+  return new Promise((resolve, reject) => {
+    fs.readdir(factoryDir, (err, files) => {
+      if (err) {
+        vscode.window.showErrorMessage(
+          `Error reading factory directory: ${err.message}`
+        );
+        reject(err);
+      } else {
+        console.log("Factory files found:", files);
+        resolve(
+          files
+            .filter((file) => file.endsWith(".rb"))
+            .map((file) => path.join(factoryDir, file))
+        );
+      }
+    });
+  });
+}
+
+async function extractFactoryNames(factoryFiles) {
+  console.log("Extracting factory names from files:", factoryFiles);
+  const factoryNames = [];
+  for (const file of factoryFiles) {
+    const content = await fs.promises.readFile(file, "utf-8");
+    const lines = content.split("\n");
+    let currentClassName = null;
+    const factoryRegex =
+      /factory\s*:\s*(\w+)\s*(?:, class:\s*['"]([\w:]+)['"])?/g;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      let match;
+      while ((match = factoryRegex.exec(line)) !== null) {
+        const factoryName = match[1];
+        const className = match[2] || currentClassName || factoryName;
+        currentClassName = className;
+        factoryNames.push({
+          displayName: `${className} - ${factoryName}`,
+          filePath: file,
+          line: i + 1,
+        });
+      }
+    }
+  }
+  console.log("Extracted factory names:", factoryNames);
+  return factoryNames;
+}
+
+function insertFactoryName(selectedFactory) {
+  console.log("Inserting factory name:", selectedFactory);
+  const editor = vscode.window.activeTextEditor;
+  if (editor) {
+    editor.edit((editBuilder) => {
+      editBuilder.insert(
+        editor.selection.active,
+        selectedFactory.displayName.split(" - ")[1]
+      );
+    });
+  }
+}
+
+async function openFactoryFile(selectedFactory) {
+  console.log("Opening factory file:", selectedFactory);
+  const document = await vscode.workspace.openTextDocument(
+    selectedFactory.filePath
+  );
+  await vscode.window.showTextDocument(document, {
+    selection: new vscode.Range(
+      new vscode.Position(selectedFactory.line - 1, 0),
+      new vscode.Position(selectedFactory.line - 1, 0)
+    ),
+  });
+}
+
+function deactivate() {
+  console.log("FactoryBot extension deactivated");
+}
+
+module.exports = {
+  activate,
+  deactivate,
+};
